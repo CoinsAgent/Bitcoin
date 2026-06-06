@@ -1,4 +1,4 @@
--- ClickHouse Bitcoin rich block schema
+-- ClickHouse Bitcoin rich block schema - fixed version
 -- Pipeline:
 --   bitcoin.blocks       -> bitcoin.transactions
 --   bitcoin.transactions -> bitcoin.inputs
@@ -6,17 +6,37 @@
 --   bitcoin.inputs       -> bitcoin.addresses
 --   bitcoin.outputs      -> bitcoin.addresses
 --
--- "->" means automatic unfolding through Materialized Views.
+-- Main fixes in this version:
+-- 1. All materialized views use explicit table aliases to avoid ClickHouse name-resolution bugs,
+--    especially blocks.hash vs tx_item.hash.
+-- 2. bitcoin.blocks.previousblockhash and nextblockhash are Nullable because Bitcoin Core can omit them
+--    for genesis block / chain tip.
+-- 3. Derived date/month columns in downstream MV target tables are ordinary columns populated explicitly
+--    by the MVs. This avoids relying on target-table MATERIALIZED expressions during MV insert.
+-- 4. Existing materialized views are dropped before being recreated, so an old wrong MV definition is replaced.
 --
--- Notes:
--- 1. The top-level block `tx` field stores rich transaction objects, not only txid strings.
--- 2. Optional transaction input fields such as coinbase/scriptSig/prevout are Nullable,
---    because coinbase inputs do not have normal txid/vout/prevout fields.
--- 3. `revision` defaults to 0 as requested.
--- 4. PRIMARY KEY is explicit for all tables.
--- 5. ReplacingMergeTree deduplication key is ORDER BY, not PRIMARY KEY.
+-- Important:
+-- - This script does not DROP existing data tables. If you already inserted bad data, recreate or truncate
+--   downstream tables and reload from bitcoin.blocks after applying the fixed MVs.
+-- - ReplacingMergeTree deduplication is based on ORDER BY, not PRIMARY KEY.
 
 CREATE DATABASE IF NOT EXISTS bitcoin;
+
+-- Drop materialized views first so they can be safely recreated with corrected logic.
+DROP VIEW IF EXISTS bitcoin.mv_inputs_to_addresses;
+DROP VIEW IF EXISTS bitcoin.mv_outputs_to_addresses;
+DROP VIEW IF EXISTS bitcoin.mv_transactions_to_outputs;
+DROP VIEW IF EXISTS bitcoin.mv_transactions_to_inputs;
+DROP VIEW IF EXISTS bitcoin.mv_blocks_to_transactions;
+
+-- If these tables already exist with MATERIALIZED derived columns, CREATE TABLE IF NOT EXISTS will not modify them.
+-- For a clean rebuild, drop downstream tables before running this file, or run ALTER MODIFY COLUMN manually.
+-- Recommended clean rebuild during development:
+-- DROP TABLE IF EXISTS bitcoin.addresses;
+-- DROP TABLE IF EXISTS bitcoin.outputs;
+-- DROP TABLE IF EXISTS bitcoin.inputs;
+-- DROP TABLE IF EXISTS bitcoin.transactions;
+-- DROP TABLE IF EXISTS bitcoin.blocks;
 
 -- ============================================================
 -- 1. Rich blocks table
@@ -38,8 +58,8 @@ CREATE TABLE IF NOT EXISTS bitcoin.blocks
     `difficulty` Float64,
     `chainwork` String,
     `nTx` UInt64,
-    `previousblockhash` String,
-    `nextblockhash` String,
+    `previousblockhash` Nullable(String),
+    `nextblockhash` Nullable(String),
     `strippedsize` UInt64,
     `size` UInt64,
     `weight` UInt64,
@@ -92,7 +112,7 @@ CREATE TABLE IF NOT EXISTS bitcoin.blocks
     )),
 
     -- Derived attributes
-    `block_datetime` DateTime MATERIALIZED toDateTime(`time`),
+    `block_datetime` DateTime('UTC') MATERIALIZED toDateTime(`time`, 'UTC'),
     `block_date` Date MATERIALIZED toDate(`block_datetime`),
     `block_month` UInt32 MATERIALIZED toYYYYMM(`block_datetime`),
 
@@ -165,10 +185,11 @@ CREATE TABLE IF NOT EXISTS bitcoin.transactions
     `fee` Nullable(Decimal(20, 8)),
     `hex` String,
 
-    -- Derived attributes
-    `transaction_datetime` DateTime MATERIALIZED toDateTime(`block_time`),
-    `transaction_date` Date MATERIALIZED toDate(`transaction_datetime`),
-    `transaction_month` UInt32 MATERIALIZED toYYYYMM(`transaction_datetime`),
+    -- Derived attributes.
+    -- These are populated explicitly by mv_blocks_to_transactions.
+    `transaction_datetime` DateTime('UTC'),
+    `transaction_date` Date,
+    `transaction_month` UInt32,
 
     -- Operational attribute
     `revision` UInt64 DEFAULT 0
@@ -216,10 +237,11 @@ CREATE TABLE IF NOT EXISTS bitcoin.inputs
     `prevout_scriptPubKey_address` Nullable(String),
     `prevout_scriptPubKey_type` Nullable(String),
 
-    -- Derived attributes
-    `input_datetime` DateTime MATERIALIZED toDateTime(`block_time`),
-    `input_date` Date MATERIALIZED toDate(`input_datetime`),
-    `input_month` UInt32 MATERIALIZED toYYYYMM(`input_datetime`),
+    -- Derived attributes.
+    -- These are populated explicitly by mv_transactions_to_inputs.
+    `input_datetime` DateTime('UTC'),
+    `input_date` Date,
+    `input_month` UInt32,
 
     -- Operational attribute
     `revision` UInt64 DEFAULT 0
@@ -259,10 +281,11 @@ CREATE TABLE IF NOT EXISTS bitcoin.outputs
     `scriptPubKey_address` Nullable(String),
     `scriptPubKey_type` Nullable(String),
 
-    -- Derived attributes
-    `output_datetime` DateTime MATERIALIZED toDateTime(`block_time`),
-    `output_date` Date MATERIALIZED toDate(`output_datetime`),
-    `output_month` UInt32 MATERIALIZED toYYYYMM(`output_datetime`),
+    -- Derived attributes.
+    -- These are populated explicitly by mv_transactions_to_outputs.
+    `output_datetime` DateTime('UTC'),
+    `output_date` Date,
+    `output_month` UInt32,
 
     -- Operational attribute
     `revision` UInt64 DEFAULT 0
@@ -302,10 +325,11 @@ CREATE TABLE IF NOT EXISTS bitcoin.addresses
     `value` Decimal(20, 8),
     `value_delta` Decimal(20, 8),
 
-    -- Derived attributes
-    `address_datetime` DateTime MATERIALIZED toDateTime(`block_time`),
-    `address_date` Date MATERIALIZED toDate(`address_datetime`),
-    `address_month` UInt32 MATERIALIZED toYYYYMM(`address_datetime`),
+    -- Derived attributes.
+    -- These are populated explicitly by mv_outputs_to_addresses and mv_inputs_to_addresses.
+    `address_datetime` DateTime('UTC'),
+    `address_date` Date,
+    `address_month` UInt32,
 
     -- Operational attribute
     `revision` UInt64 DEFAULT 0
@@ -319,19 +343,20 @@ ORDER BY (`address`, `direction`, `txid`, `source_index`);
 -- ============================================================
 -- Materialized View 1:
 -- bitcoin.blocks -> bitcoin.transactions
+-- Critical fix: use b.hash for block_hash and tx_item.hash for transaction hash.
 -- ============================================================
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS bitcoin.mv_blocks_to_transactions
+CREATE MATERIALIZED VIEW bitcoin.mv_blocks_to_transactions
 TO bitcoin.transactions
 AS
 SELECT
-    `hash` AS block_hash,
-    `height` AS block_height,
-    `time` AS block_time,
-    `mediantime` AS block_mediantime,
+    b.`hash` AS block_hash,
+    b.`height` AS block_height,
+    b.`time` AS block_time,
+    b.`mediantime` AS block_mediantime,
 
     tx_item.txid AS txid,
-    tx_item.hash AS hash,
+    tx_item.`hash` AS `hash`,
     tx_item.version AS version,
     tx_item.size AS size,
     tx_item.vsize AS vsize,
@@ -342,9 +367,13 @@ SELECT
     tx_item.fee AS fee,
     tx_item.hex AS hex,
 
-    revision
-FROM bitcoin.blocks
-ARRAY JOIN tx AS tx_item;
+    toDateTime(b.`time`, 'UTC') AS transaction_datetime,
+    toDate(toDateTime(b.`time`, 'UTC')) AS transaction_date,
+    toYYYYMM(toDateTime(b.`time`, 'UTC')) AS transaction_month,
+
+    b.revision AS revision
+FROM bitcoin.blocks AS b
+ARRAY JOIN b.tx AS tx_item;
 
 
 -- ============================================================
@@ -352,16 +381,16 @@ ARRAY JOIN tx AS tx_item;
 -- bitcoin.transactions -> bitcoin.inputs
 -- ============================================================
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS bitcoin.mv_transactions_to_inputs
+CREATE MATERIALIZED VIEW bitcoin.mv_transactions_to_inputs
 TO bitcoin.inputs
 AS
 SELECT
-    block_hash,
-    block_height,
-    block_time,
+    t.block_hash AS block_hash,
+    t.block_height AS block_height,
+    t.block_time AS block_time,
 
-    txid,
-    hash,
+    t.txid AS txid,
+    t.`hash` AS `hash`,
 
     toUInt32(vin_index_raw - 1) AS vin_index,
 
@@ -382,11 +411,15 @@ SELECT
     vin_item.prevout.scriptPubKey.address AS prevout_scriptPubKey_address,
     vin_item.prevout.scriptPubKey.type AS prevout_scriptPubKey_type,
 
-    revision
-FROM bitcoin.transactions
+    toDateTime(t.block_time, 'UTC') AS input_datetime,
+    toDate(toDateTime(t.block_time, 'UTC')) AS input_date,
+    toYYYYMM(toDateTime(t.block_time, 'UTC')) AS input_month,
+
+    t.revision AS revision
+FROM bitcoin.transactions AS t
 ARRAY JOIN
-    arrayEnumerate(vin) AS vin_index_raw,
-    vin AS vin_item;
+    arrayEnumerate(t.vin) AS vin_index_raw,
+    t.vin AS vin_item;
 
 
 -- ============================================================
@@ -394,16 +427,16 @@ ARRAY JOIN
 -- bitcoin.transactions -> bitcoin.outputs
 -- ============================================================
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS bitcoin.mv_transactions_to_outputs
+CREATE MATERIALIZED VIEW bitcoin.mv_transactions_to_outputs
 TO bitcoin.outputs
 AS
 SELECT
-    block_hash,
-    block_height,
-    block_time,
+    t.block_hash AS block_hash,
+    t.block_height AS block_height,
+    t.block_time AS block_time,
 
-    txid,
-    hash,
+    t.txid AS txid,
+    t.`hash` AS `hash`,
 
     toUInt32(vout_index_raw - 1) AS vout_index,
 
@@ -416,11 +449,15 @@ SELECT
     vout_item.scriptPubKey.address AS scriptPubKey_address,
     vout_item.scriptPubKey.type AS scriptPubKey_type,
 
-    revision
-FROM bitcoin.transactions
+    toDateTime(t.block_time, 'UTC') AS output_datetime,
+    toDate(toDateTime(t.block_time, 'UTC')) AS output_date,
+    toYYYYMM(toDateTime(t.block_time, 'UTC')) AS output_month,
+
+    t.revision AS revision
+FROM bitcoin.transactions AS t
 ARRAY JOIN
-    arrayEnumerate(vout) AS vout_index_raw,
-    vout AS vout_item;
+    arrayEnumerate(t.vout) AS vout_index_raw,
+    t.vout AS vout_item;
 
 
 -- ============================================================
@@ -429,32 +466,36 @@ ARRAY JOIN
 -- Positive rows: UTXO created
 -- ============================================================
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS bitcoin.mv_outputs_to_addresses
+CREATE MATERIALIZED VIEW bitcoin.mv_outputs_to_addresses
 TO bitcoin.addresses
 AS
 SELECT
-    assumeNotNull(scriptPubKey_address) AS address,
+    assumeNotNull(o.scriptPubKey_address) AS address,
     'output' AS direction,
 
-    txid,
-    hash,
+    o.txid AS txid,
+    o.`hash` AS `hash`,
 
-    block_hash,
-    block_height,
-    block_time,
+    o.block_hash AS block_hash,
+    o.block_height AS block_height,
+    o.block_time AS block_time,
 
-    txid AS utxo_txid,
-    vout_index AS utxo_vout,
+    o.txid AS utxo_txid,
+    o.vout_index AS utxo_vout,
 
-    vout_index AS source_index,
+    o.vout_index AS source_index,
 
-    value,
-    value AS value_delta,
+    o.value AS value,
+    o.value AS value_delta,
 
-    revision
-FROM bitcoin.outputs
-WHERE isNotNull(scriptPubKey_address)
-  AND scriptPubKey_address != '';
+    toDateTime(o.block_time, 'UTC') AS address_datetime,
+    toDate(toDateTime(o.block_time, 'UTC')) AS address_date,
+    toYYYYMM(toDateTime(o.block_time, 'UTC')) AS address_month,
+
+    o.revision AS revision
+FROM bitcoin.outputs AS o
+WHERE isNotNull(o.scriptPubKey_address)
+  AND o.scriptPubKey_address != '';
 
 
 -- ============================================================
@@ -463,35 +504,100 @@ WHERE isNotNull(scriptPubKey_address)
 -- Negative rows: previous UTXO spent
 -- ============================================================
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS bitcoin.mv_inputs_to_addresses
+CREATE MATERIALIZED VIEW bitcoin.mv_inputs_to_addresses
 TO bitcoin.addresses
 AS
 SELECT
-    assumeNotNull(prevout_scriptPubKey_address) AS address,
+    assumeNotNull(i.prevout_scriptPubKey_address) AS address,
     'input' AS direction,
 
-    txid,
-    hash,
+    i.txid AS txid,
+    i.`hash` AS `hash`,
 
-    block_hash,
-    block_height,
-    block_time,
+    i.block_hash AS block_hash,
+    i.block_height AS block_height,
+    i.block_time AS block_time,
 
-    assumeNotNull(vin_txid) AS utxo_txid,
-    assumeNotNull(vin_vout) AS utxo_vout,
+    assumeNotNull(i.vin_txid) AS utxo_txid,
+    assumeNotNull(i.vin_vout) AS utxo_vout,
 
-    vin_index AS source_index,
+    i.vin_index AS source_index,
 
-    assumeNotNull(prevout_value) AS value,
-    -assumeNotNull(prevout_value) AS value_delta,
+    assumeNotNull(i.prevout_value) AS value,
+    -assumeNotNull(i.prevout_value) AS value_delta,
 
-    revision
-FROM bitcoin.inputs
-WHERE isNotNull(prevout_scriptPubKey_address)
-  AND prevout_scriptPubKey_address != ''
-  AND isNotNull(vin_txid)
-  AND isNotNull(vin_vout)
-  AND isNotNull(prevout_value);
+    toDateTime(i.block_time, 'UTC') AS address_datetime,
+    toDate(toDateTime(i.block_time, 'UTC')) AS address_date,
+    toYYYYMM(toDateTime(i.block_time, 'UTC')) AS address_month,
+
+    i.revision AS revision
+FROM bitcoin.inputs AS i
+WHERE isNotNull(i.prevout_scriptPubKey_address)
+  AND i.prevout_scriptPubKey_address != ''
+  AND isNotNull(i.vin_txid)
+  AND isNotNull(i.vin_vout)
+  AND isNotNull(i.prevout_value);
+
+
+-- ============================================================
+-- Optional repair / reload helpers
+-- ============================================================
+
+-- If bad rows already exist, changing the MV is not enough. Rebuild downstream tables.
+-- Choose one of the following strategies carefully.
+
+-- Full downstream rebuild from existing bitcoin.blocks:
+-- TRUNCATE TABLE bitcoin.addresses;
+-- TRUNCATE TABLE bitcoin.outputs;
+-- TRUNCATE TABLE bitcoin.inputs;
+-- TRUNCATE TABLE bitcoin.transactions;
+-- INSERT INTO bitcoin.transactions
+-- SELECT
+--     b.`hash` AS block_hash,
+--     b.`height` AS block_height,
+--     b.`time` AS block_time,
+--     b.`mediantime` AS block_mediantime,
+--     tx_item.txid AS txid,
+--     tx_item.`hash` AS `hash`,
+--     tx_item.version AS version,
+--     tx_item.size AS size,
+--     tx_item.vsize AS vsize,
+--     tx_item.weight AS weight,
+--     tx_item.locktime AS locktime,
+--     tx_item.vin AS vin,
+--     tx_item.vout AS vout,
+--     tx_item.fee AS fee,
+--     tx_item.hex AS hex,
+--     toDateTime(b.`time`, 'UTC') AS transaction_datetime,
+--     toDate(toDateTime(b.`time`, 'UTC')) AS transaction_date,
+--     toYYYYMM(toDateTime(b.`time`, 'UTC')) AS transaction_month,
+--     b.revision AS revision
+-- FROM bitcoin.blocks AS b
+-- ARRAY JOIN b.tx AS tx_item;
+--
+-- Important: Materialized views on bitcoin.transactions will populate inputs/outputs,
+-- and materialized views on inputs/outputs will populate addresses.
+
+
+-- ============================================================
+-- Data validation queries
+-- ============================================================
+
+-- 1. txid/hash may be equal for non-SegWit transactions, but block_hash must not equal tx hash.
+-- SELECT count() AS bad_block_hash_rows
+-- FROM bitcoin.transactions
+-- WHERE block_hash = `hash` OR block_hash = txid;
+
+-- 2. Every transaction block_hash should join back to bitcoin.blocks.hash.
+-- SELECT count() AS orphan_transaction_block_hash_rows
+-- FROM bitcoin.transactions AS t
+-- LEFT JOIN bitcoin.blocks AS b ON t.block_hash = b.`hash`
+-- WHERE b.`hash` IS NULL;
+
+-- 3. Check address rows inherited correct block hashes.
+-- SELECT count() AS bad_address_block_hash_rows
+-- FROM bitcoin.addresses
+-- WHERE block_hash = `hash` OR block_hash = txid;
 
 
 -- ============================================================

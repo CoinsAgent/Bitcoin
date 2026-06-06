@@ -33,14 +33,18 @@ def parse_args():
     return p.parse_args()
 
 
-def build_query(table, partitions=None, per_block=False):
-    where = ""
-    if partitions:
-        # partitions should be integers like 202601
-        vals = ",".join(str(int(p)) for p in partitions)
-        where = f"WHERE address_month IN ({vals})\n"
-
-    if per_block:
+def build_query(table, partition=None, block_height=None, per_block=False):
+    """Build ClickHouse query for address counts.
+    
+    Args:
+        table: Table name (usually bitcoin.addresses)
+        partition: Single partition (YYYYMM) for filtering
+        block_height: Single block height for filtering (used when per_block=True)
+        per_block: If True, query by specific block_height; if False, query by partition
+    """
+    if per_block and block_height is not None:
+        # Query addresses for a specific partition and block_height
+        where = f"WHERE address_month = {partition} AND block_height = {block_height}"
         return f"""
 SELECT
     address_month AS partition,
@@ -49,9 +53,14 @@ SELECT
     count() AS rows,
     countDistinct(address) AS unique_addresses
 FROM {table}
-{where}GROUP BY partition, block_height, block_hash
-ORDER BY partition, block_height
+{where}
+GROUP BY address_month, block_height, block_hash
 """
+
+    # Aggregate by partition only
+    where = ""
+    if partition:
+        where = f"WHERE address_month = {partition}"
 
     return f"""
 SELECT
@@ -59,9 +68,25 @@ SELECT
     count() AS rows,
     countDistinct(address) AS unique_addresses
 FROM {table}
-{where}GROUP BY partition
-ORDER BY partition
+{where}
+GROUP BY partition
 """
+
+
+def get_blocks_for_partition(client, partition):
+    """Retrieve all blocks in a partition from bitcoin.blocks table.
+    Returns list of tuples: (partition, block_height, block_hash)
+    """
+    query = f"""
+SELECT
+    block_month,
+    height,
+    hash
+FROM bitcoin.blocks
+WHERE block_month = {partition}
+ORDER BY height
+"""
+    return client.execute(query)
 
 
 def main():
@@ -87,72 +112,90 @@ def main():
         if parts:
             partitions = parts
 
-    query = build_query(args.table, partitions=partitions, per_block=args.per_block)
-    rows = client.execute(query)
-
+    # Print header
     if args.format == "json":
-        out = []
-        if args.per_block:
-            for partition, block_height, block_hash, row_count, unique_count in rows:
-                out.append({
-                    "partition": partition,
-                    "block_height": block_height,
-                    "block_hash": block_hash,
-                    "rows": row_count,
-                    "unique_addresses": unique_count,
-                })
-        else:
-            for partition, row_count, unique_count in rows:
-                out.append({"partition": partition, "rows": row_count, "unique_addresses": unique_count})
-        print(json.dumps(out, indent=2))
-        return
-
-    if args.format == "csv":
-        # simple CSV header
+        json_out = []
+    elif args.format == "csv":
         if args.per_block:
             if args.distinct_only:
                 print("partition,block_height,block_hash,unique_addresses")
-                for partition, block_height, block_hash, row_count, unique_count in rows:
-                    print(f"{partition},{block_height},{block_hash},{unique_count}")
             else:
                 print("partition,block_height,block_hash,rows,unique_addresses")
-                for partition, block_height, block_hash, row_count, unique_count in rows:
-                    print(f"{partition},{block_height},{block_hash},{row_count},{unique_count}")
         else:
             if args.distinct_only:
                 print("partition,unique_addresses")
-                for partition, row_count, unique_count in rows:
-                    print(f"{partition},{unique_count}")
             else:
                 print("partition,rows,unique_addresses")
-                for partition, row_count, unique_count in rows:
-                    print(f"{partition},{row_count},{unique_count}")
-        return
-
-    # default table format
-    # print a simple aligned table
-    if args.per_block:
-        if args.distinct_only:
-            print(f"{'partition':>10}  {'block_height':>12}  {'block_hash':>66}  {'unique_addresses':>18}")
-            print('-' * 112)
-            for partition, block_height, block_hash, row_count, unique_count in rows:
-                print(f"{partition:>10}  {block_height:12}  {block_hash:66}  {unique_count:18}")
-        else:
-            print(f"{'partition':>10}  {'block_height':>12}  {'block_hash':>66}  {'rows':>12}  {'unique_addresses':>18}")
-            print('-' * 134)
-            for partition, block_height, block_hash, row_count, unique_count in rows:
-                print(f"{partition:>10}  {block_height:12}  {block_hash:66}  {row_count:12}  {unique_count:18}")
     else:
-        if args.distinct_only:
-            print(f"{'partition':>10}  {'unique_addresses':>18}")
-            print('-' * 32)
-            for partition, row_count, unique_count in rows:
-                print(f"{partition:>10}  {unique_count:18}")
+        # table format header
+        if args.per_block:
+            if args.distinct_only:
+                print(f"{'partition':>10}  {'block_height':>12}  {'block_hash':>66}  {'unique_addresses':>18}")
+                print('-' * 112)
+            else:
+                print(f"{'partition':>10}  {'block_height':>12}  {'block_hash':>66}  {'rows':>12}  {'unique_addresses':>18}")
+                print('-' * 134)
         else:
-            print(f"{'partition':>10}  {'rows':>12}  {'unique_addresses':>18}")
-            print('-' * 46)
-            for partition, row_count, unique_count in rows:
-                print(f"{partition:>10}  {row_count:12}  {unique_count:18}")
+            if args.distinct_only:
+                print(f"{'partition':>10}  {'unique_addresses':>18}")
+                print('-' * 32)
+            else:
+                print(f"{'partition':>10}  {'rows':>12}  {'unique_addresses':>18}")
+                print('-' * 46)
+    
+    if args.per_block and partitions:
+        # For per-block mode: fetch blocks first, then query addresses for each block
+        for partition in partitions:
+            blocks = get_blocks_for_partition(client, int(partition))
+            print(f"Processing partition {partition} with {len(blocks)} blocks...")
+            for block_partition, block_height, block_hash in blocks:
+                query = build_query(args.table, partition=int(partition), block_height=block_height, per_block=True)
+                block_rows = client.execute(query)
+                if block_rows:
+                    for partition_val, block_h, block_c, row_count, unique_count in block_rows:
+                        if args.format == "json":
+                            json_out.append({
+                                "partition": partition_val,
+                                "block_height": block_h,
+                                "block_hash": block_c,
+                                "rows": row_count,
+                                "unique_addresses": unique_count,
+                            })
+                        elif args.format == "csv":
+                            if args.distinct_only:
+                                print(f"{partition_val},{block_h},{block_c},{unique_count}")
+                            else:
+                                print(f"{partition_val},{block_h},{block_c},{row_count},{unique_count}")
+                        else:
+                            # table format
+                            if args.distinct_only:
+                                print(f"{partition_val:>10}  {block_h:12}  {block_c:66}  {unique_count:18}")
+                            else:
+                                print(f"{partition_val:>10}  {block_h:12}  {block_c:66}  {row_count:12}  {unique_count:18}")
+    else:
+        # Aggregate by partition only
+        if partitions:
+            for partition in partitions:
+                query = build_query(args.table, partition=int(partition), per_block=False)
+                partition_rows = client.execute(query)
+                for partition_val, row_count, unique_count in partition_rows:
+                    if args.format == "json":
+                        json_out.append({"partition": partition_val, "rows": row_count, "unique_addresses": unique_count})
+                    elif args.format == "csv":
+                        if args.distinct_only:
+                            print(f"{partition_val},{unique_count}")
+                        else:
+                            print(f"{partition_val},{row_count},{unique_count}")
+                    else:
+                        # table format
+                        if args.distinct_only:
+                            print(f"{partition_val:>10}  {unique_count:18}")
+                        else:
+                            print(f"{partition_val:>10}  {row_count:12}  {unique_count:18}")
+    
+    # Print JSON at the end if JSON format
+    if args.format == "json":
+        print(json.dumps(json_out, indent=2))
 
 
 if __name__ == '__main__':
