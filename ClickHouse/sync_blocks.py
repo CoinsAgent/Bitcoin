@@ -47,6 +47,7 @@ CLICKHOUSE_PASSWORD = ""
 
 BATCH_SIZE = 10  # blocks per INSERT batch
 SLEEP_ON_ERROR = 1
+SLEEP_WHEN_CAUGHT_UP = 120
 REQUEST_TIMEOUT = 60
 
 
@@ -55,6 +56,11 @@ def btc_amount_to_str(value):
     if value is None:
         return None
     return format(Decimal(str(value)).quantize(Decimal("0.00000001")), "f")
+
+
+def sql_string(value):
+    """Return a ClickHouse single-quoted string literal."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 # ============================================================
 # Bitcoin RPC Client
@@ -117,16 +123,78 @@ class ClickHouseSync:
         resp.raise_for_status()
         return resp.text.strip()
 
-    def get_last_synced_height(self) -> int:
-        """Get the highest block height already synced."""
+    def query_int(self, sql, default=0) -> int:
+        """Execute a scalar integer query."""
         try:
-            result = self.query("SELECT MAX(height) FROM blocks")
-            if result and result != "":
+            result = self.query(sql)
+            if result and result != r"\N":
                 return int(result)
-            return 0
+            return default
         except Exception as e:
-            logger.warning(f"Could not query last synced height: {e}")
-            return 0
+            logger.warning(f"Could not query integer value: {e}")
+            return default
+
+    def query_strings(self, sql) -> list[str]:
+        """Execute a single-column query and return string values."""
+        result = self.query(sql)
+        if not result:
+            return []
+        return [line for line in result.splitlines() if line and line != r"\N"]
+
+    def get_last_synced_height(self):
+        """Get the highest block height already synced, or None when blocks is empty."""
+        result = self.query(
+            """
+            SELECT if(count() = 0, -1, toInt64(max(height)))
+            FROM blocks
+            """
+        )
+        height = int(result)
+        return None if height < 0 else height
+
+    def count_missing_transactions_for_block(self, btc: BitcoinRPC, height: int) -> tuple[int, int, int]:
+        """
+        Fetch txids for the block from Bitcoin Core and compare with bitcoin.transactions.
+
+        Returns:
+            (expected_tx_count, existing_tx_count, missing_tx_count)
+        """
+        blockhash = btc.getblockhash(height)
+        block = btc.getblock(blockhash, verbosity=2)
+        expected_txids = [tx["txid"] for tx in block.get("tx", []) if tx.get("txid")]
+        expected = len(expected_txids)
+
+        existing_txids = set()
+        chunk_size = 1000
+        for i in range(0, expected, chunk_size):
+            chunk = expected_txids[i : i + chunk_size]
+            txid_list = ", ".join(sql_string(txid) for txid in chunk)
+            rows = self.query_strings(
+                f"""
+                SELECT DISTINCT txid
+                FROM transactions FINAL
+                WHERE block_height = {height}
+                  AND txid IN ({txid_list})
+                """
+            )
+            existing_txids.update(rows)
+
+        existing = len(existing_txids)
+        missing = expected - existing
+        return expected, existing, missing
+
+    def is_block_transactions_complete(self, btc: BitcoinRPC, height: int) -> bool:
+        expected, existing, missing = self.count_missing_transactions_for_block(btc, height)
+        complete = expected > 0 and missing == 0 and existing >= expected
+        logger.info(
+            "Transaction completeness for block %s: expected=%s existing=%s missing=%s complete=%s",
+            height,
+            expected,
+            existing,
+            missing,
+            complete,
+        )
+        return complete
 
     def insert_blocks_json(self, blocks_json: list[dict]):
         """Insert blocks using JSONEachRow format."""
@@ -246,6 +314,76 @@ def transform_block(block: dict) -> dict:
 # ============================================================
 # Main Sync Loop
 # ============================================================
+def determine_resume_height(btc: BitcoinRPC, ch: ClickHouseSync, explicit_start):
+    """Return the next block height to fetch from Bitcoin Core."""
+    if explicit_start is not None:
+        return explicit_start
+
+    last_synced = ch.get_last_synced_height()
+    if last_synced is None:
+        logger.info("bitcoin.blocks is empty; starting from block 0")
+        return 0
+
+    logger.info(f"Max block height in ClickHouse bitcoin.blocks: {last_synced}")
+    if ch.is_block_transactions_complete(btc, last_synced):
+        return last_synced + 1
+
+    logger.warning(
+        "Block %s exists in bitcoin.blocks but its transactions are incomplete; resyncing from this block",
+        last_synced,
+    )
+    return last_synced
+
+
+def sync_range(btc: BitcoinRPC, ch: ClickHouseSync, start: int, stop: int, batch_size: int, dry_run: bool) -> tuple[int, int]:
+    """Fetch blocks from Bitcoin Core and insert them into ClickHouse."""
+    total_to_sync = stop - start + 1
+    logger.info(f"Syncing blocks {start} → {stop} ({total_to_sync} blocks)")
+
+    batch = []
+    t0 = time.time()
+    synced_count = 0
+    error_count = 0
+
+    for height in range(start, stop + 1):
+        try:
+            blockhash = btc.getblockhash(height)
+            block = btc.getblock(blockhash, verbosity=3)
+            batch.append(transform_block(block))
+            synced_count += 1
+
+        except Exception as e:
+            error_count += 1
+            logger.error(f"Failed block {height}: {e}")
+            time.sleep(SLEEP_ON_ERROR)
+            break
+
+        # Insert batch
+        if len(batch) >= batch_size:
+            if not dry_run:
+                ch.insert_blocks_json(batch)
+            logger.info(f"  Inserted batch ending at height {height}")
+            batch = []
+
+        # Progress report
+        if synced_count % 100 == 0:
+            elapsed = time.time() - t0
+            rate = synced_count / elapsed
+            logger.info(f"  Progress: {synced_count}/{total_to_sync} blocks "
+                        f"in {elapsed:.1f}s ({rate:.1f} blocks/s)")
+
+    # Flush remaining
+    if batch:
+        if not dry_run:
+            ch.insert_blocks_json(batch)
+        logger.info(f"Flushed remaining {len(batch)} blocks")
+
+    total_time = time.time() - t0
+    logger.info(f"Range done. Synced {synced_count} blocks ({error_count} errors) "
+                f"in {total_time:.1f}s")
+    return synced_count, error_count
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync Bitcoin blocks from full node to ClickHouse",
@@ -267,72 +405,70 @@ Examples:
                         help="Blocks per INSERT batch (default: 10)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and transform but do not insert")
+    parser.add_argument("--poll-interval", type=int, default=SLEEP_WHEN_CAUGHT_UP,
+                        help="Seconds to sleep when full node tip equals ClickHouse height (default: 120)")
     args = parser.parse_args()
 
     btc = BitcoinRPC(BITCOIN_RPC_URL, BITCOIN_RPC_USER, BITCOIN_RPC_PASSWORD)
     ch = ClickHouseSync(CLICKHOUSE_HTTP_URL, CLICKHOUSE_DATABASE,
                         CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 
-    # Determine range
-    tip = btc.getblockcount()
-    logger.info(f"Node tip: {tip}")
+    bounded_run = args.start is not None or args.stop is not None or args.dry_run
+    total_synced = 0
+    total_errors = 0
 
-    last_synced = ch.get_last_synced_height()
-    logger.info(f"Last synced height in ClickHouse: {last_synced}")
+    try:
+        next_start = determine_resume_height(btc, ch, args.start)
 
-    start = args.start if args.start is not None else last_synced + 1
-    stop = args.stop if args.stop is not None else tip
+        while True:
+            tip = btc.getblockcount()
+            logger.info(f"Node tip: {tip}")
 
-    if start > stop:
-        logger.info(f"Nothing to sync. Start={start}, Stop={stop}, Tip={tip}")
+            start = next_start
+            stop = args.stop if args.stop is not None else tip
+
+            if start > stop:
+                logger.info(
+                    "ClickHouse is caught up with the full node. "
+                    "Next start=%s, stop=%s, node tip=%s",
+                    start,
+                    stop,
+                    tip,
+                )
+                if bounded_run:
+                    break
+
+                logger.info(
+                    "Full node tip is not ahead of ClickHouse. Sleeping %s seconds before retrying.",
+                    args.poll_interval,
+                )
+                time.sleep(args.poll_interval)
+                continue
+
+            synced_count, error_count = sync_range(
+                btc,
+                ch,
+                start,
+                stop,
+                args.batch_size,
+                args.dry_run,
+            )
+            total_synced += synced_count
+            total_errors += error_count
+
+            if error_count > 0:
+                logger.error("Stopping sync loop because this pass had %s error(s)", error_count)
+                break
+
+            if bounded_run:
+                break
+
+            next_start = stop + 1
+
+    finally:
         ch.close()
-        return
 
-    total_to_sync = stop - start + 1
-    logger.info(f"Syncing blocks {start} → {stop} ({total_to_sync} blocks)")
-
-    batch = []
-    t0 = time.time()
-    synced_count = 0
-    error_count = 0
-
-    for height in range(start, stop + 1):
-        try:
-            blockhash = btc.getblockhash(height)
-            block = btc.getblock(blockhash, verbosity=3)
-            batch.append(transform_block(block))
-            synced_count += 1
-
-        except Exception as e:
-            error_count += 1
-            logger.error(f"Failed block {height}: {e}")
-            time.sleep(SLEEP_ON_ERROR)
-            continue
-
-        # Insert batch
-        if len(batch) >= args.batch_size:
-            if not args.dry_run:
-                ch.insert_blocks_json(batch)
-            logger.info(f"  Inserted batch ending at height {height}")
-            batch = []
-
-        # Progress report
-        if synced_count % 100 == 0:
-            elapsed = time.time() - t0
-            rate = synced_count / elapsed
-            logger.info(f"  Progress: {synced_count}/{total_to_sync} blocks "
-                        f"in {elapsed:.1f}s ({rate:.1f} blocks/s)")
-
-    # Flush remaining
-    if batch:
-        if not args.dry_run:
-            ch.insert_blocks_json(batch)
-        logger.info(f"Flushed remaining {len(batch)} blocks")
-
-    ch.close()
-    total_time = time.time() - t0
-    logger.info(f"Done. Synced {synced_count} blocks ({error_count} errors) "
-                f"in {total_time:.1f}s")
+    logger.info(f"Done. Synced {total_synced} blocks ({total_errors} errors)")
 
 if __name__ == "__main__":
     main()
