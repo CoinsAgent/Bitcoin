@@ -64,7 +64,6 @@ from typing import Any, Iterable, Optional
 
 
 SLEEP_WHEN_CAUGHT_UP = 120
-ADDRESS_PARTITION_CHUNK_SIZE = 2000
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,7 +144,7 @@ def get_clickhouse_max_block_height(ch_client: Any) -> Optional[int]:
 def get_transaction_month_for_block(ch_client: Any, block_height: int) -> Optional[int]:
     result = ch_client.execute(
         f"""
-        SELECT toYYYYMM(toDateTime(time, 'UTC')) AS transaction_month
+        SELECT toYYYYMM(toDateTime(time)) AS transaction_month
         FROM bitcoin.blocks FINAL
         WHERE height = {int(block_height)}
         ORDER BY revision DESC
@@ -177,7 +176,7 @@ def get_clickhouse_txids_for_block(ch_client: Any, block_height: int) -> list[st
 def get_block_by_height(ch_client: Any, block_height: int) -> Optional[tuple[int, int, str]]:
     query = f"""
         SELECT
-            toYYYYMM(toDateTime(time, 'UTC')) AS block_month,
+            toYYYYMM(toDateTime(time)) AS block_month,
             height,
             hash
         FROM bitcoin.blocks
@@ -187,36 +186,6 @@ def get_block_by_height(ch_client: Any, block_height: int) -> Optional[tuple[int
     """
     result = ch_client.execute(query)
     return result[0] if result else None
-
-
-def get_clickhouse_max_partition(ch_client: Any) -> Optional[int]:
-    result = ch_client.execute(
-        """
-        SELECT if(count() = 0, -1, toInt64(max(block_month)))
-        FROM bitcoin.blocks
-        """
-    )
-    partition = int(result[0][0])
-    return None if partition < 0 else partition
-
-
-def get_partition_for_height(ch_client: Any, block_height: int) -> Optional[int]:
-    block = get_block_by_height(ch_client, block_height)
-    if block is None:
-        return None
-    return int(block[0])
-
-
-def get_first_height_after_partition(ch_client: Any, partition: int) -> Optional[int]:
-    result = ch_client.execute(
-        f"""
-        SELECT if(count() = 0, -1, toInt64(min(height)))
-        FROM bitcoin.blocks
-        WHERE block_month > {int(partition)}
-        """
-    )
-    height = int(result[0][0])
-    return None if height < 0 else height
 
 
 def get_addresses_for_block(ch_client: Any, partition: Optional[int], block_height: int) -> list[AddressRow]:
@@ -240,37 +209,6 @@ def get_addresses_for_block(ch_client: Any, partition: Optional[int], block_heig
         WHERE block_height = {int(block_height)}
           {partition_filter}
         ORDER BY address, txid, direction, source_index, utxo_vout
-    """
-    rows = ch_client.execute(query)
-    return [AddressRow(*row) for row in rows]
-
-
-def get_addresses_for_partition_chunk(
-    ch_client: Any,
-    partition: int,
-    offset: int,
-    limit: int = ADDRESS_PARTITION_CHUNK_SIZE,
-) -> list[AddressRow]:
-    query = f"""
-        SELECT
-            address,
-            direction,
-            txid,
-            hash,
-            block_hash,
-            block_height,
-            block_time,
-            utxo_txid,
-            utxo_vout,
-            source_index,
-            value,
-            value_delta,
-            revision
-        FROM bitcoin.addresses
-        WHERE address_month = {int(partition)}
-        ORDER BY block_height, txid, direction, source_index, address, utxo_txid, utxo_vout
-        LIMIT {int(limit)}
-        OFFSET {int(offset)}
     """
     rows = ch_client.execute(query)
     return [AddressRow(*row) for row in rows]
@@ -700,7 +638,7 @@ def insert_vertices_and_edges(
     continue_on_error: bool = False,
 ) -> tuple[int, int, int, int, int]:
     """Insert address vertices, tx vertices, and input/output edges into NebulaGraph."""
-    batch_size = ADDRESS_PARTITION_CHUNK_SIZE
+    batch_size = 1000
     address_vertices = 0
     tx_vertices = 0
     input_edge_count = 0
@@ -837,13 +775,15 @@ def sync_range(
     *,
     debug_ngql: bool,
     continue_on_error: bool,
-) -> int:
+) -> Optional[int]:
     """Sync data from ClickHouse to NebulaGraph from next_start to clickhouse_tip."""
     block_heights = list(range(int(next_start), int(clickhouse_tip) + 1))
-    failed_total = 0
+    last_processed_height = None
     print(f"Generated {len(block_heights)} block height(s) to sync from {next_start} to {clickhouse_tip}")
 
     for height in block_heights:
+        last_processed_height = int(height)
+
         block = get_block_by_height(
             ch_client,
             int(height),
@@ -877,59 +817,8 @@ def sync_range(
             f"output_edges={output_edges}, "
             f"failed={failed}"
         )
-        failed_total += failed
 
-    return failed_total
-
-
-def sync_partition_by_chunks(
-    ch_client: Any,
-    ng_session: Any,
-    partition: int,
-    *,
-    debug_ngql: bool,
-    continue_on_error: bool,
-) -> int:
-    """Sync every address row in an older complete partition in fixed-size chunks."""
-    offset = 0
-    failed_total = 0
-
-    print(
-        f"Syncing complete historical partition {partition} "
-        f"in chunks of {ADDRESS_PARTITION_CHUNK_SIZE} address rows"
-    )
-
-    while True:
-        rows = get_addresses_for_partition_chunk(
-            ch_client,
-            partition,
-            offset,
-            ADDRESS_PARTITION_CHUNK_SIZE,
-        )
-        if not rows:
-            break
-
-        print(f"  Partition {partition}: offset={offset} rows={len(rows)}")
-        address_vertices, tx_vertices, input_edges, output_edges, failed = insert_vertices_and_edges(
-            ng_session,
-            rows,
-            debug_ngql=debug_ngql,
-            continue_on_error=continue_on_error,
-        )
-        failed_total += failed
-
-        print(
-            "    Inserted: "
-            f"address_vertices={address_vertices}, "
-            f"tx_vertices={tx_vertices}, "
-            f"input_edges={input_edges}, "
-            f"output_edges={output_edges}, "
-            f"failed={failed}"
-        )
-
-        offset += len(rows)
-
-    return failed_total
+    return failed
 
 
 # -----------------------------
@@ -999,52 +888,20 @@ def main() -> None:
                 time.sleep(args.poll_interval)
                 continue
 
-            current_partition = get_partition_for_height(ch_client, next_start)
-            max_partition = get_clickhouse_max_partition(ch_client)
-            if current_partition is None or max_partition is None:
-                print(f"Could not determine ClickHouse partition for height {next_start}.")
-                print(f"Sleeping {args.poll_interval} seconds before checking ClickHouse again.")
-                time.sleep(args.poll_interval)
-                continue
+            failed = sync_range(
+                ch_client,
+                ng_session,
+                next_start,
+                clickhouse_tip,
+                debug_ngql=args.debug_ngql,
+                continue_on_error=args.continue_on_error,
+            )
 
-            if clickhouse_tip - next_start < 10:
-                print(
-                    "Near ClickHouse tip; syncing block by block. "
-                    f"next_start={next_start}, clickhouse_tip={clickhouse_tip}"
-                )
-                failed = sync_range(
-                    ch_client,
-                    ng_session,
-                    next_start,
-                    clickhouse_tip,
-                    debug_ngql=args.debug_ngql,
-                    continue_on_error=args.continue_on_error,
-                )
-                next_start = clickhouse_tip + 1
-            elif current_partition < max_partition:
-                failed = sync_partition_by_chunks(
-                    ch_client,
-                    ng_session,
-                    current_partition,
-                    debug_ngql=args.debug_ngql,
-                    continue_on_error=args.continue_on_error,
-                )
-                next_partition_height = get_first_height_after_partition(ch_client, current_partition)
-                next_start = next_partition_height if next_partition_height is not None else clickhouse_tip + 1
-            else:
-                failed = sync_range(
-                    ch_client,
-                    ng_session,
-                    next_start,
-                    clickhouse_tip,
-                    debug_ngql=args.debug_ngql,
-                    continue_on_error=args.continue_on_error,
-                )
-                next_start = clickhouse_tip + 1
-
-            if failed > 0:
-                print(f"WARNING: {failed} insert(s) failed in this sync pass. Check logs for details.", file=sys.stderr)
+            if failed is not None and failed > 0:
+                print(f"WARNING: {failed} insert(s) failed in this sync range. Check logs for details.", file=sys.stderr)
                 break
+
+            next_start = clickhouse_tip + 1
             
     finally:
         try:
