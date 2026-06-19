@@ -24,6 +24,7 @@ import time
 import argparse
 import logging
 import requests as req
+from datetime import datetime, timezone
 from decimal import Decimal
 
 logging.basicConfig(
@@ -58,9 +59,9 @@ def btc_amount_to_str(value):
     return format(Decimal(str(value)).quantize(Decimal("0.00000001")), "f")
 
 
-def sql_string(value):
-    """Return a ClickHouse single-quoted string literal."""
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+def utc_yyyymm_from_unix_time(timestamp: int) -> int:
+    """Return a UTC YYYYMM integer from a Unix timestamp."""
+    return int(datetime.fromtimestamp(int(timestamp), tz=timezone.utc).strftime("%Y%m"))
 
 # ============================================================
 # Bitcoin RPC Client
@@ -134,13 +135,6 @@ class ClickHouseSync:
             logger.warning(f"Could not query integer value: {e}")
             return default
 
-    def query_strings(self, sql) -> list[str]:
-        """Execute a single-column query and return string values."""
-        result = self.query(sql)
-        if not result:
-            return []
-        return [line for line in result.splitlines() if line and line != r"\N"]
-
     def get_last_synced_height(self):
         """Get the highest block height already synced, or None when blocks is empty."""
         result = self.query(
@@ -154,32 +148,24 @@ class ClickHouseSync:
 
     def count_missing_transactions_for_block(self, btc: BitcoinRPC, height: int) -> tuple[int, int, int]:
         """
-        Fetch txids for the block from Bitcoin Core and compare with bitcoin.transactions.
+        Fetch nTx and block month from Bitcoin Core and compare with bitcoin.transactions.
 
         Returns:
             (expected_tx_count, existing_tx_count, missing_tx_count)
         """
         blockhash = btc.getblockhash(height)
-        block = btc.getblock(blockhash, verbosity=2)
-        expected_txids = [tx["txid"] for tx in block.get("tx", []) if tx.get("txid")]
-        expected = len(expected_txids)
+        block = btc.getblock(blockhash, verbosity=1)
+        expected = int(block["nTx"])
+        transaction_month = utc_yyyymm_from_unix_time(block["time"])
 
-        existing_txids = set()
-        chunk_size = 1000
-        for i in range(0, expected, chunk_size):
-            chunk = expected_txids[i : i + chunk_size]
-            txid_list = ", ".join(sql_string(txid) for txid in chunk)
-            rows = self.query_strings(
-                f"""
-                SELECT DISTINCT txid
-                FROM transactions FINAL
-                WHERE block_height = {height}
-                  AND txid IN ({txid_list})
-                """
-            )
-            existing_txids.update(rows)
-
-        existing = len(existing_txids)
+        existing = self.query_int(
+            f"""
+            SELECT count()
+            FROM transactions FINAL
+            WHERE block_height = {height}
+              AND transaction_month = {transaction_month}
+            """
+        )
         missing = expected - existing
         return expected, existing, missing
 
