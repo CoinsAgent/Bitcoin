@@ -1,0 +1,134 @@
+# Nebula Importer plan for the VID-only Bitcoin address graph.
+#
+# This plan imports one exported partition directory at a time. Update the
+# three file paths below from /tmp/nebula_csv/202401/... to the partition you
+# want to import, or copy this file into a partition directory and change paths
+# to ./tx_vertices.csv, ./input_to_tx_edges.csv, and ./tx_to_output_edges.csv.
+#
+# Expected CSV files from export_clickhouse_to_nebula_csv_by_partition.py:
+#   tx_vertices.csv:
+#     :VID,txid,hash,block_hash,block_height,block_time
+#   input_to_tx_edges.csv:
+#     :SRC,:DST,:RANK,txid,input_index,utxo_txid,utxo_vout,value
+#   tx_to_output_edges.csv:
+#     :SRC,:DST,:RANK,utxo_txid,utxo_vout,value
+
+version: v3
+description: Import Bitcoin tx vertices and VID-only address edges for one UTC partition.
+removeTempFiles: false
+
+clientSettings:
+  retry: 3
+  concurrency: 8
+  channelBufferSize: 128
+  space: bitcoin
+  connection:
+    user: root
+    password: nebula
+    address: 127.0.0.1:9669
+
+logPath: ./nebula-importer.log
+
+files:
+  - path: /home/btc/nebula_csv/202601/tx_vertices.csv
+    failDataPath: ./failed/202601/tx_vertices.csv
+    batchSize: 10000
+    inOrder: true
+    type: csv
+    csv:
+      withHeader: true
+      withLabel: false
+    schema:
+      type: vertex
+      vertex:
+        vid:
+          index: 0
+          type: string
+        tags:
+          - name: tx
+            props:
+              - name: txid
+                type: string
+                index: 1
+              - name: hash
+                type: string
+                index: 2
+              - name: block_hash
+                type: string
+                index: 3
+              - name: block_height
+                type: int
+                index: 4
+              - name: block_time
+                type: int
+                index: 5
+
+  - path: /home/btc/nebula_csv/202601/input_to_tx_edges.csv
+    failDataPath: ./failed/202601/input_to_tx_edges.csv
+    batchSize: 10000
+    inOrder: true
+    type: csv
+    csv:
+      withHeader: true
+      withLabel: false
+    schema:
+      type: edge
+      edge:
+        name: input_to_tx
+        withRanking: true
+        srcVID:
+          index: 0
+          type: string
+        dstVID:
+          index: 1
+          type: string
+        rank:
+          index: 2
+        props:
+          - name: txid
+            type: string
+            index: 3
+          - name: input_index
+            type: int
+            index: 4
+          - name: utxo_txid
+            type: string
+            index: 5
+          - name: utxo_vout
+            type: int
+            index: 6
+          - name: value
+            type: double
+            index: 7
+
+  - path: /home/btc/nebula_csv/202601/tx_to_output_edges.csv
+    failDataPath: ./failed/202601/tx_to_output_edges.csv
+    batchSize: 10000
+    inOrder: true
+    type: csv
+    csv:
+      withHeader: true
+      withLabel: false
+    schema:
+      type: edge
+      edge:
+        name: tx_to_output
+        withRanking: true
+        srcVID:
+          index: 0
+          type: string
+        dstVID:
+          index: 1
+          type: string
+        rank:
+          index: 2
+        props:
+          - name: utxo_txid
+            type: string
+            index: 3
+          - name: utxo_vout
+            type: int
+            index: 4
+          - name: value
+            type: double
+            index: 5
