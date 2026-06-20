@@ -1,0 +1,367 @@
+-- ============================================================
+-- NebulaGraph Schema: Bitcoin VID-Only Address Graph
+-- Purpose:
+--   Build a lean production graph for address traversal, hop analysis,
+--   transaction neighborhoods, and path finding.
+--
+-- Recommended model:
+--   Address VID --input_to_tx--> Tx vertex --tx_to_output--> Address VID
+--
+-- Address recommendation:
+--   Do not create an address tag when the address has no useful properties.
+--
+--   Store the Bitcoin address directly in the vertex ID:
+--     addr:<bitcoin_address>
+--
+--   Examples:
+--     addr:bc1qxxxx
+--     addr:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+--
+--   This avoids storing the same address twice:
+--     1. in the VID
+--     2. in an address.address property
+--
+--   For traversal from a known address, a tag index is not needed:
+--     GO FROM "addr:<address>" OVER input_to_tx ...
+--
+--   NebulaGraph can start from a known VID directly. A tag index only helps
+--   when searching by tag property, for example:
+--     LOOKUP ON address WHERE address.address == "bc1..."
+--
+--   Because Bitcoin address and txid lookups are usually exact, the application
+--   should construct VIDs directly:
+--     "addr:" + address
+--     "tx:" + txid
+--
+-- Query patterns supported:
+--   1. Find hops between two known addresses:
+--        FIND PATH FROM "addr:A" TO "addr:B" ...
+--
+--   2. Find related addresses from one known address within N hops:
+--        GO FROM "addr:A" OVER input_to_tx ...
+--
+--   3. Find related addresses by known txid:
+--        GO FROM "tx:T" OVER tx_to_output ...
+--
+--   4. Find related addresses by block hash/height/time:
+--        LOOKUP tx by indexed tx property, then traverse from tx VID.
+--
+-- Important limitation:
+--   This model shows transaction-level connection.
+--   It does NOT prove exact attribution from a specific input address
+--   to a specific output address inside a multi-input/multi-output tx.
+-- ============================================================
+
+-- ============================================================
+-- 1. Create graph space
+-- ============================================================
+
+CREATE SPACE IF NOT EXISTS bitcoin(
+  partition_num = 256
+  replica_factor = 2,
+  vid_type = FIXED_STRING(100)
+);
+
+-- Wait for the space to be ready before running the rest of the file
+-- if your NebulaGraph console returns an error immediately after CREATE SPACE.
+-- In that case, run:
+--   :sleep 10
+-- then execute the statements below again.
+
+USE bitcoin;
+
+-- ============================================================
+-- 2. Vertex tags
+-- ============================================================
+
+-- Address tag intentionally removed.
+--
+-- Address vertices are VID-only endpoints:
+--   addr:<bitcoin_address>
+--
+-- Do not insert address vertices with:
+--   INSERT VERTEX address(...)
+--
+-- Edges may point to address VIDs directly. Traversal from a known address
+-- remains fast because NebulaGraph starts from the VID.
+--
+-- Add an address tag back only if you need address properties in NebulaGraph,
+-- such as labels, risk scores, cluster IDs, entity metadata, or property-based
+-- address lookup. For this traversal/path schema, the address tag is
+-- unnecessary storage and unnecessary write work.
+
+-- Transaction vertex.
+--
+-- VID format:
+--   tx:<txid>
+--
+-- txid is kept as a property even though it is also encoded in the VID.
+-- This is convenient in query output and allows optional property lookup.
+-- If every caller always constructs "tx:<txid>" directly, tx_txid_index below
+-- can be removed.
+--
+-- hash is kept separately because Bitcoin Core exposes both txid and hash.
+-- For SegWit transactions, this can help compare identifiers from different
+-- sources.
+--
+-- Block attributes live only on tx, not on edges:
+--   block_hash
+--   block_height
+--   block_time
+--
+-- A transaction belongs to one block, but a transaction may have many input
+-- and output edges. Storing block fields on every edge duplicates data heavily
+-- and can create consistency problems during reloads.
+CREATE TAG IF NOT EXISTS tx (
+  txid string,
+  hash string,
+  block_hash string,
+  block_height int64,
+  block_time int64
+);
+
+-- ============================================================
+-- 3. Edge types
+-- ============================================================
+
+-- Input-side bridge edge.
+--
+-- Direction:
+--   Address VID -> Tx vertex
+--
+-- Example:
+--   addr:A --input_to_tx--> tx:T
+--
+-- Meaning:
+--   Address A appears in one input of transaction T.
+--
+-- Kept properties:
+--   utxo_txid:
+--     The previous transaction ID of the UTXO being spent by this input.
+--     For input_to_tx, this is usually vin.txid from Bitcoin Core.
+--
+--   utxo_vout:
+--     The previous output index inside utxo_txid being spent.
+--     For input_to_tx, this is usually vin.vout from Bitcoin Core.
+--
+--   source_index:
+--     The input index inside the current transaction T.
+--     For input_to_tx, this is the vin array position.
+--
+--   value:
+--     The BTC value of the previous output being spent.
+--
+--   value_delta:
+--     Signed value movement from this address perspective.
+--     For inputs this is normally negative, because the address is spending.
+--
+--   revision:
+--     Loader/schema revision marker for idempotent reloads or future fixes.
+--
+-- Removed properties:
+--   direction:
+--     Redundant because the edge type already means input direction.
+--
+--   txid, hash, block_hash, block_height, block_time:
+--     Redundant because these are transaction/block facts stored on tx vertex.
+CREATE EDGE IF NOT EXISTS input_to_tx (
+  utxo_txid string,
+  utxo_vout int64,
+  source_index int64,
+  value double,
+  value_delta double,
+  revision int64
+);
+
+-- Output-side bridge edge.
+--
+-- Direction:
+--   Tx vertex -> Address VID
+--
+-- Example:
+--   tx:T --tx_to_output--> addr:C
+--
+-- Meaning:
+--   Transaction T creates one output paying address C.
+--
+-- Kept properties:
+--   utxo_txid:
+--     The transaction ID that created this output.
+--     For tx_to_output, this is the current transaction T's txid.
+--
+--   utxo_vout:
+--     The output index inside the current transaction T.
+--     For tx_to_output, this is usually vout.n from Bitcoin Core.
+--
+--   source_index:
+--     The output index inside the current transaction T.
+--     For outputs this normally equals utxo_vout. It is kept so input and
+--     output edge rows have the same analytical shape: "position in the
+--     transaction side represented by this edge."
+--
+--   value:
+--     The BTC value of this newly created output.
+--
+--   value_delta:
+--     Signed value movement from this address perspective.
+--     For outputs this is normally positive, because the address receives.
+--
+--   revision:
+--     Loader/schema revision marker for idempotent reloads or future fixes.
+--
+-- Direction-specific UTXO note:
+--   input_to_tx.utxo_txid / input_to_tx.utxo_vout identify the OLD UTXO
+--   being consumed by the current transaction.
+--
+--   tx_to_output.utxo_txid / tx_to_output.utxo_vout identify the NEW UTXO
+--   being created by the current transaction.
+--
+--   source_index always means the position on the current transaction side:
+--     input_to_tx: vin index
+--     tx_to_output: vout index
+--
+-- Removed properties:
+--   direction:
+--     Redundant because the edge type already means output direction.
+--
+--   txid, hash, block_hash, block_height, block_time:
+--     Redundant because these are transaction/block facts stored on tx vertex.
+CREATE EDGE IF NOT EXISTS tx_to_output (
+  utxo_txid string,
+  utxo_vout int64,
+  source_index int64,
+  value double,
+  value_delta double,
+  revision int64
+);
+
+-- ============================================================
+-- 4. Indexes
+-- ============================================================
+-- Address index intentionally removed.
+--
+-- Address lookup by known address should construct the VID directly:
+--   "addr:" + address
+--
+-- Transaction indexes are kept only where they support property-to-VID
+-- discovery before traversal.
+
+-- Optional:
+--   Use this only if some callers query txid as a property:
+--     LOOKUP ON tx WHERE tx.txid == "<txid>" YIELD id(vertex);
+--
+--   If all callers construct the tx VID directly:
+--     "tx:" + txid
+--
+--   then this index can be removed.
+CREATE TAG INDEX IF NOT EXISTS tx_txid_index
+ON tx(txid(90));
+
+-- Required for fast lookup when the user starts from a block hash:
+--   LOOKUP ON tx WHERE tx.block_hash == "<block_hash>" YIELD id(vertex);
+CREATE TAG INDEX IF NOT EXISTS tx_block_hash_index
+ON tx(block_hash(90));
+
+-- Required for fast lookup when the user starts from a block height:
+--   LOOKUP ON tx WHERE tx.block_height == 850000 YIELD id(vertex);
+CREATE TAG INDEX IF NOT EXISTS tx_block_height_index
+ON tx(block_height);
+
+-- Useful for time-window discovery inside NebulaGraph.
+-- If time-range filtering is done in ClickHouse and only txids are passed into
+-- NebulaGraph, this index is optional.
+CREATE TAG INDEX IF NOT EXISTS tx_block_time_index
+ON tx(block_time);
+
+-- ============================================================
+-- 5. Rebuild indexes
+-- ============================================================
+-- Run these after data is loaded if you use indexes.
+-- For very large initial loads, create/rebuild indexes after loading data.
+-- ============================================================
+
+-- REBUILD TAG INDEX tx_txid_index;
+-- REBUILD TAG INDEX tx_block_hash_index;
+-- REBUILD TAG INDEX tx_block_height_index;
+-- REBUILD TAG INDEX tx_block_time_index;
+
+-- ============================================================
+-- 6. Example insert statements
+-- ============================================================
+-- These are commented out. Use them only for testing.
+--
+-- Notice:
+--   There is no INSERT VERTEX for address. Address VIDs are used directly
+--   as edge endpoints.
+-- ============================================================
+
+-- INSERT VERTEX tx(txid, hash, block_hash, block_height, block_time)
+-- VALUES "tx:T":("T", "T", "000000000000", 850000, 1718000000);
+
+-- Inputs:
+-- A spends previous UTXO prevA:0 into transaction T.
+-- B spends previous UTXO prevB:1 into transaction T.
+--
+-- Edge rank uses source_index, the vin index inside current transaction T.
+-- INSERT EDGE input_to_tx(
+--   utxo_txid, utxo_vout, source_index, value, value_delta, revision
+-- )
+-- VALUES
+--   "addr:A" -> "tx:T"@0:("prevA", 0, 0, 1.0, -1.0, 0),
+--   "addr:B" -> "tx:T"@1:("prevB", 1, 1, 2.0, -2.0, 0);
+
+-- Outputs:
+-- Transaction T creates new UTXOs T:0 and T:1.
+--
+-- Edge rank uses utxo_vout/output index.
+-- INSERT EDGE tx_to_output(
+--   utxo_txid, utxo_vout, source_index, value, value_delta, revision
+-- )
+-- VALUES
+--   "tx:T" -> "addr:C"@0:("T", 0, 0, 2.5, 2.5, 0),
+--   "tx:T" -> "addr:D"@1:("T", 1, 1, 0.49, 0.49, 0);
+
+-- ============================================================
+-- 7. Example traversal queries
+-- ============================================================
+
+-- One address-hop:
+--   Address -> Tx -> Address
+--
+-- GO FROM "addr:A"
+-- OVER input_to_tx
+-- YIELD dst(edge) AS tx_vid
+-- | GO FROM $-.tx_vid
+--   OVER tx_to_output
+--   YIELD dst(edge) AS output_address;
+
+-- Related output addresses from a known txid:
+--   Tx -> output addresses
+--
+-- GO FROM "tx:T"
+-- OVER tx_to_output
+-- YIELD dst(edge) AS output_address, properties(edge).value AS value;
+
+-- Related input addresses from a known txid:
+--   Tx <- input addresses
+--
+-- GO FROM "tx:T"
+-- OVER input_to_tx REVERSELY
+-- YIELD src(edge) AS input_address, properties(edge).value AS value;
+
+-- Find tx vertices by block hash, then traverse to output addresses:
+--
+-- LOOKUP ON tx
+-- WHERE tx.block_hash == "000000000000"
+-- YIELD id(vertex) AS tx_vid
+-- | GO FROM $-.tx_vid
+--   OVER tx_to_output
+--   YIELD dst(edge) AS output_address;
+
+-- Shortest path between two addresses.
+-- 1 address-hop = 2 graph steps.
+-- 3 address-hops = 6 graph steps.
+--
+-- FIND SHORTEST PATH FROM "addr:A" TO "addr:C"
+-- OVER input_to_tx, tx_to_output
+-- UPTO 6 STEPS;
