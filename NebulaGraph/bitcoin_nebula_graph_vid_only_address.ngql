@@ -136,6 +136,16 @@ CREATE TAG IF NOT EXISTS tx (
 --   Address A appears in one input of transaction T.
 --
 -- Kept properties:
+--   txid:
+--     The current transaction ID, meaning the transaction this input belongs to.
+--     For input_to_tx, this is the same txid encoded in the destination tx VID.
+--     It is kept on the edge so inputs can be found directly by txid with an
+--     edge index.
+--
+--   input_index:
+--     The input index inside the current transaction T.
+--     For input_to_tx, this is the vin array position.
+--
 --   utxo_txid:
 --     The previous transaction ID of the UTXO being spent by this input.
 --     For input_to_tx, this is usually vin.txid from Bitcoin Core.
@@ -144,33 +154,21 @@ CREATE TAG IF NOT EXISTS tx (
 --     The previous output index inside utxo_txid being spent.
 --     For input_to_tx, this is usually vin.vout from Bitcoin Core.
 --
---   source_index:
---     The input index inside the current transaction T.
---     For input_to_tx, this is the vin array position.
---
 --   value:
 --     The BTC value of the previous output being spent.
---
---   value_delta:
---     Signed value movement from this address perspective.
---     For inputs this is normally negative, because the address is spending.
---
---   revision:
---     Loader/schema revision marker for idempotent reloads or future fixes.
 --
 -- Removed properties:
 --   direction:
 --     Redundant because the edge type already means input direction.
 --
---   txid, hash, block_hash, block_height, block_time:
+--   hash, block_hash, block_height, block_time:
 --     Redundant because these are transaction/block facts stored on tx vertex.
 CREATE EDGE IF NOT EXISTS input_to_tx (
+  txid string,
+  input_index int64,
   utxo_txid string,
   utxo_vout int64,
-  source_index int64,
-  value double,
-  value_delta double,
-  revision int64
+  value double
 );
 
 -- Output-side bridge edge.
@@ -187,27 +185,14 @@ CREATE EDGE IF NOT EXISTS input_to_tx (
 -- Kept properties:
 --   utxo_txid:
 --     The transaction ID that created this output.
---     For tx_to_output, this is the current transaction T's txid.
+--     For tx_to_output, this is the current transaction txid.
 --
 --   utxo_vout:
 --     The output index inside the current transaction T.
 --     For tx_to_output, this is usually vout.n from Bitcoin Core.
 --
---   source_index:
---     The output index inside the current transaction T.
---     For outputs this normally equals utxo_vout. It is kept so input and
---     output edge rows have the same analytical shape: "position in the
---     transaction side represented by this edge."
---
 --   value:
 --     The BTC value of this newly created output.
---
---   value_delta:
---     Signed value movement from this address perspective.
---     For outputs this is normally positive, because the address receives.
---
---   revision:
---     Loader/schema revision marker for idempotent reloads or future fixes.
 --
 -- Direction-specific UTXO note:
 --   input_to_tx.utxo_txid / input_to_tx.utxo_vout identify the OLD UTXO
@@ -216,23 +201,16 @@ CREATE EDGE IF NOT EXISTS input_to_tx (
 --   tx_to_output.utxo_txid / tx_to_output.utxo_vout identify the NEW UTXO
 --   being created by the current transaction.
 --
---   source_index always means the position on the current transaction side:
---     input_to_tx: vin index
---     tx_to_output: vout index
---
 -- Removed properties:
 --   direction:
 --     Redundant because the edge type already means output direction.
 --
---   txid, hash, block_hash, block_height, block_time:
+--   txid, input_index, hash, block_hash, block_height, block_time:
 --     Redundant because these are transaction/block facts stored on tx vertex.
 CREATE EDGE IF NOT EXISTS tx_to_output (
   utxo_txid string,
   utxo_vout int64,
-  source_index int64,
-  value double,
-  value_delta double,
-  revision int64
+  value double
 );
 
 -- ============================================================
@@ -257,11 +235,6 @@ CREATE EDGE IF NOT EXISTS tx_to_output (
 CREATE TAG INDEX IF NOT EXISTS tx_txid_index
 ON tx(txid(90));
 
--- Required for fast lookup when the user starts from a block hash:
---   LOOKUP ON tx WHERE tx.block_hash == "<block_hash>" YIELD id(vertex);
-CREATE TAG INDEX IF NOT EXISTS tx_block_hash_index
-ON tx(block_hash(90));
-
 -- Required for fast lookup when the user starts from a block height:
 --   LOOKUP ON tx WHERE tx.block_height == 850000 YIELD id(vertex);
 CREATE TAG INDEX IF NOT EXISTS tx_block_height_index
@@ -281,7 +254,6 @@ ON tx(block_time);
 -- ============================================================
 
 -- REBUILD TAG INDEX tx_txid_index;
--- REBUILD TAG INDEX tx_block_hash_index;
 -- REBUILD TAG INDEX tx_block_height_index;
 -- REBUILD TAG INDEX tx_block_time_index;
 
@@ -302,24 +274,24 @@ ON tx(block_time);
 -- A spends previous UTXO prevA:0 into transaction T.
 -- B spends previous UTXO prevB:1 into transaction T.
 --
--- Edge rank uses source_index, the vin index inside current transaction T.
+-- Edge rank uses input_index, the vin index inside current transaction T.
 -- INSERT EDGE input_to_tx(
---   utxo_txid, utxo_vout, source_index, value, value_delta, revision
+--   txid, input_index, utxo_txid, utxo_vout, value
 -- )
 -- VALUES
---   "addr:A" -> "tx:T"@0:("prevA", 0, 0, 1.0, -1.0, 0),
---   "addr:B" -> "tx:T"@1:("prevB", 1, 1, 2.0, -2.0, 0);
+--   "addr:A" -> "tx:T"@0:("T", 0, "prevA", 0, 1.0),
+--   "addr:B" -> "tx:T"@1:("T", 1, "prevB", 1, 2.0);
 
 -- Outputs:
 -- Transaction T creates new UTXOs T:0 and T:1.
 --
 -- Edge rank uses utxo_vout/output index.
 -- INSERT EDGE tx_to_output(
---   utxo_txid, utxo_vout, source_index, value, value_delta, revision
+--   utxo_txid, utxo_vout, value
 -- )
 -- VALUES
---   "tx:T" -> "addr:C"@0:("T", 0, 0, 2.5, 2.5, 0),
---   "tx:T" -> "addr:D"@1:("T", 1, 1, 0.49, 0.49, 0);
+--   "tx:T" -> "addr:C"@0:("T", 0, 2.5),
+--   "tx:T" -> "addr:D"@1:("T", 1, 0.49);
 
 -- ============================================================
 -- 7. Example traversal queries
