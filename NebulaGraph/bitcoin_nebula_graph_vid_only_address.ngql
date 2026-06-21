@@ -57,7 +57,7 @@
 -- ============================================================
 
 CREATE SPACE IF NOT EXISTS bitcoin(
-  partition_num = 256
+  partition_num = 256,
   replica_factor = 2,
   vid_type = FIXED_STRING(100)
 );

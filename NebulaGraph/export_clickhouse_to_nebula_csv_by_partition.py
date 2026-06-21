@@ -26,6 +26,7 @@ import argparse
 import csv
 import datetime as dt
 import sys
+import textwrap
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
@@ -34,6 +35,10 @@ from typing import Any, Iterable
 DEFAULT_CH_HOST = "192.168.2.241"
 DEFAULT_CH_PORT = 9000
 DEFAULT_OUTPUT_DIR = "nebula_csv"
+DEFAULT_NG_SPACE = "bitcoin"
+DEFAULT_IMPORTER_CONFIG_NAME = "bitcoin_import.yaml"
+DEFAULT_IMPORTER_MOUNT_ROOT = "/importer"
+PROGRESS_EVERY_ROWS = 1_000_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +66,45 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
         help=f"Base directory for generated per-partition CSV files (default: {DEFAULT_OUTPUT_DIR}).",
+    )
+    p.add_argument(
+        "--ng-space",
+        default=DEFAULT_NG_SPACE,
+        help=f"NebulaGraph space name for generated importer configs (default: {DEFAULT_NG_SPACE}).",
+    )
+    p.add_argument(
+        "--importer-config-name",
+        default=DEFAULT_IMPORTER_CONFIG_NAME,
+        help=(
+            "Importer config filename to write inside each partition directory "
+            f"(default: {DEFAULT_IMPORTER_CONFIG_NAME})."
+        ),
+    )
+    p.add_argument(
+        "--importer-mount-root",
+        default=DEFAULT_IMPORTER_MOUNT_ROOT,
+        help=(
+            "Container path where output-dir is mounted for generated importer configs "
+            f"(default: {DEFAULT_IMPORTER_MOUNT_ROOT})."
+        ),
+    )
+    p.add_argument(
+        "--importer-batch",
+        type=int,
+        default=10_000,
+        help="Nebula importer batch size for generated configs (default: 10000).",
+    )
+    p.add_argument(
+        "--importer-reader-concurrency",
+        type=int,
+        default=2,
+        help="Nebula importer reader concurrency for generated configs (default: 2).",
+    )
+    p.add_argument(
+        "--importer-concurrency",
+        type=int,
+        default=8,
+        help="Nebula importer write concurrency for generated configs (default: 8).",
     )
     p.add_argument(
         "--no-final",
@@ -138,6 +182,11 @@ def iter_clickhouse_rows(ch_client: Any, query: str, max_block_size: int) -> Ite
     yield from ch_client.execute(query, settings=settings)
 
 
+def print_progress(label: str, count: int) -> None:
+    if count and count % PROGRESS_EVERY_ROWS == 0:
+        print(f"  {label}: wrote {count:,} rows", flush=True)
+
+
 def write_tx_vertices_csv(
     ch_client: Any,
     output_path: Path,
@@ -156,7 +205,6 @@ def write_tx_vertices_csv(
             toInt64(block_time) AS block_time
         FROM {table_expr(database, "transactions", use_final)}
         WHERE transaction_month = {int(partition)}
-        ORDER BY block_height, txid
     """
 
     count = 0
@@ -179,6 +227,7 @@ def write_tx_vertices_csv(
                 ]
             )
             count += 1
+            print_progress("tx_vertices", count)
     return count
 
 
@@ -205,7 +254,6 @@ def write_input_edges_csv(
           AND address != ''
           AND txid != ''
           AND utxo_txid != ''
-        ORDER BY block_height, txid, input_index, address, utxo_txid, utxo_vout
     """
 
     count = 0
@@ -230,6 +278,7 @@ def write_input_edges_csv(
                 ]
             )
             count += 1
+            print_progress("input_to_tx_edges", count)
     return count
 
 
@@ -255,7 +304,6 @@ def write_output_edges_csv(
           AND address != ''
           AND txid != ''
           AND utxo_txid != ''
-        ORDER BY block_height, txid, utxo_vout, address
     """
 
     count = 0
@@ -278,7 +326,136 @@ def write_output_edges_csv(
                 ]
             )
             count += 1
+            print_progress("tx_to_output_edges", count)
     return count
+
+
+def importer_path(mount_root: str, partition: int, filename: str) -> str:
+    return f"{mount_root.rstrip('/')}/{partition}/{filename}"
+
+
+def write_importer_config(
+    output_path: Path,
+    *,
+    partition: int,
+    mount_root: str,
+    ng_space: str,
+    batch: int,
+    reader_concurrency: int,
+    importer_concurrency: int,
+) -> None:
+    config = f"""\
+    client:
+      version: v3
+      address: graphd:9669
+      user: root
+      password: nebula
+      retry: 3
+      concurrencyPerAddress: 4
+      reconnectInitialInterval: 1s
+      retryInitialInterval: 1s
+
+    manager:
+      spaceName: {ng_space}
+      batch: {int(batch)}
+      readerConcurrency: {int(reader_concurrency)}
+      importerConcurrency: {int(importer_concurrency)}
+      statsInterval: 10s
+
+    log:
+      level: INFO
+      console: true
+      files:
+        - {importer_path(mount_root, partition, "nebula-importer.log")}
+
+    sources:
+      - path: {importer_path(mount_root, partition, "tx_vertices.csv")}
+        batch: {int(batch)}
+        csv:
+          withHeader: true
+        tags:
+          - name: tx
+            id:
+              type: STRING
+              index: 0
+            props:
+              - name: txid
+                type: STRING
+                index: 1
+              - name: hash
+                type: STRING
+                index: 2
+              - name: block_hash
+                type: STRING
+                index: 3
+              - name: block_height
+                type: INT
+                index: 4
+              - name: block_time
+                type: INT
+                index: 5
+
+      - path: {importer_path(mount_root, partition, "input_to_tx_edges.csv")}
+        batch: {int(batch)}
+        csv:
+          withHeader: true
+        edges:
+          - name: input_to_tx
+            src:
+              id:
+                type: STRING
+                index: 0
+            dst:
+              id:
+                type: STRING
+                index: 1
+            rank:
+              index: 2
+            props:
+              - name: txid
+                type: STRING
+                index: 3
+              - name: input_index
+                type: INT
+                index: 4
+              - name: utxo_txid
+                type: STRING
+                index: 5
+              - name: utxo_vout
+                type: INT
+                index: 6
+              - name: value
+                type: DOUBLE
+                index: 7
+
+      - path: {importer_path(mount_root, partition, "tx_to_output_edges.csv")}
+        batch: {int(batch)}
+        csv:
+          withHeader: true
+        edges:
+          - name: tx_to_output
+            src:
+              id:
+                type: STRING
+                index: 0
+            dst:
+              id:
+                type: STRING
+                index: 1
+            rank:
+              index: 2
+            props:
+              - name: utxo_txid
+                type: STRING
+                index: 3
+              - name: utxo_vout
+                type: INT
+                index: 4
+              - name: value
+                type: DOUBLE
+                index: 5
+    """
+    output_path.write_text(textwrap.dedent(config), encoding="utf-8")
 
 
 def main() -> int:
@@ -347,6 +524,15 @@ def main() -> int:
             use_final=use_final,
             max_block_size=args.max_block_size,
         )
+        write_importer_config(
+            partition_dir / args.importer_config_name,
+            partition=partition,
+            mount_root=args.importer_mount_root,
+            ng_space=args.ng_space,
+            batch=args.importer_batch,
+            reader_concurrency=args.importer_reader_concurrency,
+            importer_concurrency=args.importer_concurrency,
+        )
 
         total_tx_count += tx_count
         total_input_count += input_count
@@ -356,6 +542,7 @@ def main() -> int:
             f"tx_vertices={tx_count}, input_to_tx_edges={input_count}, "
             f"tx_to_output_edges={output_count}"
         )
+        print(f"Partition {partition}: importer config={partition_dir / args.importer_config_name}")
 
     print(
         "Total rows: "

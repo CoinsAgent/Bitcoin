@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Generated NebulaGraph CSV exports.
+nebula_csv/
+nebula_cvs/
