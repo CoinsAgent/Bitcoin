@@ -1,0 +1,15 @@
+# Reference fragment for the Nebula Importer v3 graphd import profile.
+# The main compose file already contains this service.
+services:
+  bitcoin-importer:
+    image: vesoft/nebula-importer:latest
+    profiles:
+      - tools
+    command:
+      - --config
+      - /importer/${BITCOIN_IMPORT_PARTITION:-202601}/bitcoin_import.yaml
+    volumes:
+      - /home/btc/nebula:/importer
+    depends_on:
+      - graphd
+      - console

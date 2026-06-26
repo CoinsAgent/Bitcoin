@@ -21,9 +21,9 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      - 9559
-      - 19559
-      - 19560
+      - "9559:9559"
+      - "19559:19559"
+      - "19560:19560"
     volumes:
       - ./data/meta0:/data/meta
       - ./logs/meta0:/logs
@@ -55,9 +55,9 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      - 9559
-      - 19559
-      - 19560
+      - "9560:9559"
+      - "19561:19559"
+      - "19562:19560"
     volumes:
       - ./data/meta1:/data/meta
       - ./logs/meta1:/logs
@@ -89,9 +89,9 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      - 9559
-      - 19559
-      - 19560
+      - "9561:9559"
+      - "19563:19559"
+      - "19564:19560"
     volumes:
       - ./data/meta2:/data/meta
       - ./logs/meta2:/logs
@@ -367,7 +367,7 @@ services:
       - --config
       - /importer/${BITCOIN_IMPORT_PARTITION:-202601}/bitcoin_import.yaml
     volumes:
-      - ../../nebula_csv:/importer
+      - ../../../nebula:/importer
     depends_on:
       - graphd
       - console
