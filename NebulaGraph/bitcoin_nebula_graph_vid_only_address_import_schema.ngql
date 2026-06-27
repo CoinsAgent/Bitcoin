@@ -1,5 +1,0 @@
-CREATE SPACE IF NOT EXISTS bitcoin(partition_num=256, replica_factor=2, vid_type=FIXED_STRING(100));
-USE bitcoin;
-CREATE TAG IF NOT EXISTS tx(txid string, hash string, block_hash string, block_height int64, block_time int64);
-CREATE EDGE IF NOT EXISTS input_to_tx(txid string, input_index int64, utxo_txid string, utxo_vout int64, value double);
-CREATE EDGE IF NOT EXISTS tx_to_output(utxo_txid string, utxo_vout int64, value double);
