@@ -25,7 +25,7 @@ STORAGE_CONTAINER_SUFFIX="${STORAGE_CONTAINER_SUFFIX:--1}"
 STORAGE_COUNT="${STORAGE_COUNT:-3}"
 REMOTE_ROOT="${REMOTE_ROOT:-/home/btc/nebula_sst_monthly}"
 REPO_ROOT="${REPO_ROOT:-/home/btc/Bitcoin/NebulaGraph/sst-importer}"
-BASE_CONF="${BASE_CONF:-$REPO_ROOT/conf/clickhouse_sst_192_168_2_65.conf}"
+BASE_CONF="${BASE_CONF:-$REPO_ROOT/conf/clickhouse_sst_host.conf}"
 RUN_CONF_DIR="${RUN_CONF_DIR:-$REPO_ROOT/conf/generated_monthly}"
 LOG_DIR="${LOG_DIR:-$REMOTE_ROOT/logs}"
 KEEP_SST="${KEEP_SST:-1}"
@@ -162,13 +162,17 @@ make_month_conf() {
   local month_root="$REMOTE_ROOT/$month"
   local conf="$RUN_CONF_DIR/clickhouse_sst_${month}.conf"
   local graph_literal meta_literal
+  if [[ ! -f "$BASE_CONF" ]]; then
+    log "Base Exchange config not found: $BASE_CONF"
+    return 1
+  fi
   mkdir -p "$month_root/sst_output" "$month_root/errors"
   graph_literal="$(printf '%s' "$GRAPH_CONF_ADDRS" | awk -F, '{for(i=1;i<=NF;i++){printf "%s\"%s\"", (i==1?"":", "), $i}}')"
   meta_literal="$(printf '%s' "$META_ADDRS" | awk -F, '{for(i=1;i<=NF;i++){printf "%s\"%s\"", (i==1?"":", "), $i}}')"
   MONTH="$month" MONTH_ROOT="$month_root" GRAPH_LITERAL="$graph_literal" META_LITERAL="$meta_literal" perl -0pe '
     s/202601/$ENV{MONTH}/g;
-    s#/home/btc/nebula_sst_clickhouse_[0-9]{6}/sst_output#$ENV{MONTH_ROOT}/sst_output#g;
-    s#/home/btc/nebula_sst_clickhouse_[0-9]{6}/errors#$ENV{MONTH_ROOT}/errors#g;
+    s#/home/btc/nebula_sst_clickhouse(?:_[0-9]{6})?/sst_output#$ENV{MONTH_ROOT}/sst_output#g;
+    s#/home/btc/nebula_sst_clickhouse(?:_[0-9]{6})?/errors#$ENV{MONTH_ROOT}/errors#g;
     s#graph:\s*\[[^\]]+\]#graph: [$ENV{GRAPH_LITERAL}]#s;
     s#meta:\s*\[[^\]]+\]#meta: [$ENV{META_LITERAL}]#s;
   ' "$BASE_CONF" > "$conf"

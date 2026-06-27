@@ -100,6 +100,7 @@ def last_table(output: str) -> List[Dict[str, Any]]:
 class Result:
     passed: int = 0
     failed: int = 0
+    skipped: int = 0
 
     def ok(self, label: str, detail: str = "") -> None:
         self.passed += 1
@@ -110,6 +111,11 @@ class Result:
         self.failed += 1
         suffix = f" {detail}" if detail else ""
         print(f"FAIL {label}{suffix}")
+
+    def skip(self, label: str, detail: str = "") -> None:
+        self.skipped += 1
+        suffix = f" {detail}" if detail else ""
+        print(f"SKIP {label}{suffix}")
 
 
 class Verifier:
@@ -543,12 +549,23 @@ class Verifier:
         chains = self.sample_chains()
         self.info(f"Sampled UTXO chains={len(chains)}")
         if not chains:
-            self.result.fail("sample_chains", "no in-range chained UTXO samples found")
+            message = (
+                "no in-range chained UTXO samples found; this is common for early partitions "
+                "such as 200901 where sampled transactions may be coinbase or outputs may not "
+                "be spent inside the imported range"
+            )
+            if self.args.require_chain_samples:
+                self.result.fail("sample_chains", message)
+            else:
+                self.result.skip("sample_chains", message)
         for index, chain in enumerate(chains, start=1):
             self.section(f"UTXO Chain Sample {index}/{len(chains)}")
             self.compare_chain(chain)
 
-        print(f"SUMMARY passed={self.result.passed} failed={self.result.failed}", flush=True)
+        print(
+            f"SUMMARY passed={self.result.passed} failed={self.result.failed} skipped={self.result.skipped}",
+            flush=True,
+        )
         return 0 if self.result.failed == 0 else 2
 
 
@@ -557,7 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Verify one ClickHouse monthly partition against the NebulaGraph bitcoin space."
     )
     parser.add_argument("--partition", required=True, type=parse_partition, help="Month partition to verify, e.g. 202401")
-    parser.add_argument("--import-start", default="202401", type=parse_partition, help="First imported month for in-range UTXO chains")
+    parser.add_argument("--import-start", default="200901", type=parse_partition, help="First imported month for in-range UTXO chains")
     parser.add_argument("--space", default="bitcoin", help="Nebula space name")
     parser.add_argument("--tx-samples", type=int, default=5, help="Number of sampled transactions to verify")
     parser.add_argument("--chain-samples", type=int, default=5, help="Number of exact UTXO chains to verify")
@@ -576,6 +593,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graph-password", default="nebula", help="Nebula password")
     parser.add_argument("--nebula-timeout", type=int, default=120, help="Per Nebula query timeout seconds")
     parser.add_argument("--verbose", action="store_true", help="Print detailed ClickHouse rows and Nebula edge fetches")
+    parser.add_argument(
+        "--require-chain-samples",
+        action="store_true",
+        help="Fail if no ClickHouse UTXO chain samples are found; by default this is reported as SKIP",
+    )
     return parser
 
 
