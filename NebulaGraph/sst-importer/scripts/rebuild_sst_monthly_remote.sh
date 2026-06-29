@@ -116,8 +116,16 @@ extract_job_id() {
 }
 
 submit_job() {
-  local command="$1"
-  run_ngql "$(printf 'USE %s;\nSUBMIT JOB %s;\nSHOW JOBS;' "$SPACE" "$command")" | tee -a "$LOG_DIR/jobs.log" | extract_job_id
+  local command="$1" output job_id
+  output="$(run_ngql "$(printf 'USE %s;\nSUBMIT JOB %s;\nSHOW JOBS;' "$SPACE" "$command")")"
+  printf '%s\n' "$output" >> "$LOG_DIR/jobs.log"
+  job_id="$(extract_job_id <<<"$output")"
+  if [[ -z "$job_id" ]]; then
+    log "Could not parse job id for SUBMIT JOB $command"
+    printf '%s\n' "$output"
+    return 1
+  fi
+  printf '%s\n' "$job_id"
 }
 
 wait_job() {
