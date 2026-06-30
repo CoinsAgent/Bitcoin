@@ -14,6 +14,8 @@ SPARK_MASTER="${SPARK_MASTER:-local[4]}"
 SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-8g}"
 SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-192.168.2.65}"
 SHUFFLE_PARTITIONS="${SHUFFLE_PARTITIONS:-256}"
+SPARK_TASK_MAX_FAILURES="${SPARK_TASK_MAX_FAILURES:-4}"
+EXPECTED_SST_FILES="${EXPECTED_SST_FILES:-$((SHUFFLE_PARTITIONS * 3))}"
 SPARK_DOCKER_IMAGE="${SPARK_DOCKER_IMAGE:-}"
 SPARK_DOCKER_NETWORK="${SPARK_DOCKER_NETWORK:-nebula_nebula-net}"
 SPARK_DOCKER_SPARK_DIR="${SPARK_DOCKER_SPARK_DIR:-/opt/spark-3.3.4-bin-hadoop3}"
@@ -211,6 +213,7 @@ run_exchange() {
     --master "$SPARK_MASTER" \
     --driver-memory "$SPARK_DRIVER_MEMORY" \
     --conf "spark.sql.shuffle.partitions=$SHUFFLE_PARTITIONS" \
+    --conf "spark.task.maxFailures=$SPARK_TASK_MAX_FAILURES" \
     --class com.vesoft.nebula.exchange.Exchange \
     "$EXCHANGE_JAR" \
     -c "$conf" 2>&1 | tee "$LOG_DIR/exchange_${month}.log"
@@ -220,7 +223,11 @@ run_exchange() {
   error_count="$(find "$month_root/errors" -type f | wc -l)"
   size="$(du -sh "$month_root/sst_output" | awk '{print $1}')"
   log "$month SST files=$sst_count size=$size error_files=$error_count"
-  if [[ "$sst_count" -eq 0 || "$error_count" -ne 0 ]]; then
+  if grep -qiE 'MalformedChunkCodingException|Job aborted due to stage failure|Task [0-9]+ in stage [0-9.]+ failed|ERROR TaskSetManager' "$LOG_DIR/exchange_${month}.log"; then
+    log "$month Exchange log contains Spark/ClickHouse failures"
+    return 1
+  fi
+  if [[ "$sst_count" -ne "$EXPECTED_SST_FILES" || "$error_count" -ne 0 ]]; then
     log "$month has invalid SST output"
     return 1
   fi
